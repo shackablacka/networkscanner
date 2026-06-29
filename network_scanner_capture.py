@@ -41,11 +41,30 @@ from datetime import datetime
 from typing import Dict, Iterable, Optional
 
 try:
-    from scapy.all import ARP, Ether, IP, conf, get_if_addr, get_if_hwaddr, sniff, srp, wrpcap
+    from scapy.all import (
+        ARP,
+        BOOTP,
+        DHCP,
+        DNS,
+        DNSQR,
+        Ether,
+        ICMP,
+        IP,
+        Raw,
+        TCP,
+        UDP,
+        conf,
+        get_if_addr,
+        get_if_hwaddr,
+        sniff,
+        srp,
+        wrpcap,
+    )
     SCAPY_IMPORT_ERROR = None
 except ImportError as exc:
     # Import lazily/fail later so `--help` and ARP-table-only utilities can still work.
-    ARP = Ether = IP = conf = get_if_addr = get_if_hwaddr = sniff = srp = wrpcap = None
+    ARP = BOOTP = DHCP = DNS = DNSQR = Ether = ICMP = IP = Raw = TCP = UDP = None
+    conf = get_if_addr = get_if_hwaddr = sniff = srp = wrpcap = None
     SCAPY_IMPORT_ERROR = exc
 
 
@@ -323,13 +342,180 @@ def choose_device(devices: Dict[str, Device], target: Optional[str]) -> Device:
             print(exc)
 
 
-def packet_line(pkt) -> str:
-    """Build a compact, non-payload packet summary."""
-    ts = datetime.fromtimestamp(float(pkt.time)).strftime("%H:%M:%S") if hasattr(pkt, "time") else "--:--:--"
+PROTOCOL_FILTERS = {
+    # Safe capture/display presets. These only filter traffic already visible to this machine.
+    "all": "",
+    "arp": "arp",
+    "dns": "udp port 53 or tcp port 53",
+    "http": "tcp port 80",
+    "https": "tcp port 443",
+    "web": "tcp port 80 or tcp port 443",
+    "dhcp": "udp port 67 or udp port 68",
+    "icmp": "icmp",
+    "ping": "icmp",
+    "ssh": "tcp port 22",
+    "ftp": "tcp port 21 or tcp port 20",
+    "smtp": "tcp port 25 or tcp port 465 or tcp port 587",
+    "imap": "tcp port 143 or tcp port 993",
+    "pop3": "tcp port 110 or tcp port 995",
+    "ntp": "udp port 123",
+    "mdns": "udp port 5353",
+    "llmnr": "udp port 5355",
+    "netbios": "udp port 137 or udp port 138 or tcp port 139",
+    "smb": "tcp port 445",
+    "rdp": "tcp port 3389",
+}
+
+
+HTTP_METHODS = {"GET", "POST", "HEAD", "PUT", "DELETE", "PATCH", "OPTIONS", "TRACE", "CONNECT"}
+
+
+def available_protocols() -> str:
+    return ", ".join(sorted(PROTOCOL_FILTERS.keys()))
+
+
+def build_bpf_filter(target_ip: str, protocols: list[str], custom_bpf: Optional[str] = None) -> str:
+    """Build a BPF capture filter for the selected host and protocol presets."""
+    base = f"host {target_ip}"
+
+    if custom_bpf:
+        return f"({base}) and ({custom_bpf})"
+
+    normalized = [p.strip().lower() for p in protocols if p.strip()]
+    if not normalized or "all" in normalized:
+        return base
+
+    unknown = [p for p in normalized if p not in PROTOCOL_FILTERS]
+    if unknown:
+        raise SystemExit(f"Unknown protocol preset(s): {', '.join(unknown)}. Available: {available_protocols()}")
+
+    protocol_parts = [PROTOCOL_FILTERS[p] for p in normalized if PROTOCOL_FILTERS[p]]
+    if not protocol_parts:
+        return base
+
+    return f"({base}) and ({' or '.join(f'({part})' for part in protocol_parts)})"
+
+
+def packet_protocol(pkt) -> str:
+    """Classify packet protocol for display purposes."""
     try:
-        return f"[{ts}] {pkt.summary()}"
+        if pkt.haslayer(ARP):
+            return "ARP"
+        if pkt.haslayer(DNS):
+            return "DNS"
+        if pkt.haslayer(DHCP) or pkt.haslayer(BOOTP):
+            return "DHCP"
+        if pkt.haslayer(ICMP):
+            return "ICMP"
+        if pkt.haslayer(TCP):
+            sport = int(pkt[TCP].sport)
+            dport = int(pkt[TCP].dport)
+            ports = {sport, dport}
+            if 80 in ports:
+                return "HTTP"
+            if 443 in ports:
+                return "HTTPS"
+            if 22 in ports:
+                return "SSH"
+            if 445 in ports:
+                return "SMB"
+            if 3389 in ports:
+                return "RDP"
+            if 21 in ports or 20 in ports:
+                return "FTP"
+            if 25 in ports or 465 in ports or 587 in ports:
+                return "SMTP"
+            if 143 in ports or 993 in ports:
+                return "IMAP"
+            if 110 in ports or 995 in ports:
+                return "POP3"
+            return "TCP"
+        if pkt.haslayer(UDP):
+            sport = int(pkt[UDP].sport)
+            dport = int(pkt[UDP].dport)
+            ports = {sport, dport}
+            if 53 in ports:
+                return "DNS"
+            if 67 in ports or 68 in ports:
+                return "DHCP"
+            if 123 in ports:
+                return "NTP"
+            if 5353 in ports:
+                return "mDNS"
+            if 5355 in ports:
+                return "LLMNR"
+            if 137 in ports or 138 in ports:
+                return "NetBIOS"
+            return "UDP"
+        if pkt.haslayer(IP):
+            return "IP"
     except Exception:
-        return f"[{ts}] <packet>"
+        pass
+    return "OTHER"
+
+
+def safe_raw_preview(pkt, limit: int = 80) -> str:
+    """Return a short printable preview of packet payload metadata, not full sensitive content."""
+    try:
+        if not pkt.haslayer(Raw):
+            return ""
+        raw = bytes(pkt[Raw].load)
+        text = raw[:limit].decode("utf-8", errors="replace")
+        text = "".join(ch if 32 <= ord(ch) <= 126 else "." for ch in text)
+        return text
+    except Exception:
+        return ""
+
+
+def packet_line(pkt, show_details: bool = False) -> str:
+    """Build a compact packet summary without dumping full payload contents."""
+    ts = datetime.fromtimestamp(float(pkt.time)).strftime("%H:%M:%S") if hasattr(pkt, "time") else "--:--:--"
+    proto = packet_protocol(pkt)
+
+    try:
+        src = dst = "?"
+        extra = ""
+
+        if pkt.haslayer(IP):
+            src = pkt[IP].src
+            dst = pkt[IP].dst
+        elif pkt.haslayer(ARP):
+            src = pkt[ARP].psrc
+            dst = pkt[ARP].pdst
+
+        if pkt.haslayer(TCP):
+            src = f"{src}:{pkt[TCP].sport}"
+            dst = f"{dst}:{pkt[TCP].dport}"
+        elif pkt.haslayer(UDP):
+            src = f"{src}:{pkt[UDP].sport}"
+            dst = f"{dst}:{pkt[UDP].dport}"
+
+        if pkt.haslayer(DNS):
+            try:
+                qr = pkt[DNS].qr
+                if qr == 0 and pkt[DNS].qd and pkt[DNS].qd.qname:
+                    qname = pkt[DNS].qd.qname.decode(errors="replace").rstrip(".")
+                    extra = f" query={qname}"
+                elif qr == 1:
+                    extra = " response"
+            except Exception:
+                pass
+
+        if proto == "HTTP" and pkt.haslayer(Raw):
+            preview = safe_raw_preview(pkt, 120)
+            first = preview.split("\\r\\n", 1)[0].split("\\n", 1)[0]
+            method = first.split(" ", 1)[0].upper() if first else ""
+            if method in HTTP_METHODS or first.startswith("HTTP/"):
+                extra = f" {first[:100]}"
+
+        if show_details:
+            return f"[{ts}] {proto:<7} {src} -> {dst}{extra} | {pkt.summary()}"
+        return f"[{ts}] {proto:<7} {src} -> {dst}{extra}"
+    except Exception:
+        try:
+            return f"[{ts}] {proto:<7} {pkt.summary()}"
+        except Exception:
+            return f"[{ts}] <packet>"
 
 
 def capture_for_device(
@@ -338,38 +524,63 @@ def capture_for_device(
     iface: Optional[str],
     count: int,
     timeout: Optional[int],
+    protocols: list[str],
+    custom_bpf: Optional[str] = None,
+    show_details: bool = False,
 ) -> None:
     require_scapy()
+    bpf_filter = build_bpf_filter(target_ip, protocols, custom_bpf)
     print("\n[*] Starting packet capture")
     print(f"    Target filter : host {target_ip}")
+    print(f"    Protocols     : {', '.join(protocols) if protocols else 'all'}")
+    if custom_bpf:
+        print(f"    Custom BPF    : {custom_bpf}")
+    print(f"    Final BPF     : {bpf_filter}")
     print(f"    Interface     : {iface or conf.iface}")
     print(f"    Output        : {output}")
     print(f"    Stop condition: {'count=' + str(count) if count else ''} {'timeout=' + str(timeout) + 's' if timeout else ''}".strip())
-    print("[*] Press Ctrl+C to stop early. Payloads are not printed; packets are saved to PCAP.\n")
+    print("[*] Press Ctrl+C to stop early. Full payloads are not printed; packets are saved to PCAP.\n")
 
     packets = []
 
     def on_packet(pkt):
-        print(packet_line(pkt))
+        print(packet_line(pkt, show_details=show_details))
         packets.append(pkt)
 
-    # BPF filter keeps collection limited to the selected IP. If libpcap/BPF is unavailable,
-    # fall back to a Python-level filter.
+    # BPF filter keeps collection limited to the selected IP/protocols. If libpcap/BPF is unavailable,
+    # fall back to a Python-level host filter.
     try:
         sniff(
             iface=iface,
-            filter=f"host {target_ip}",
+            filter=bpf_filter,
             prn=on_packet,
             store=False,
             count=count if count > 0 else 0,
             timeout=timeout,
         )
     except Exception as exc:
-        print(f"[!] BPF capture failed ({exc}). Falling back to Python-level filtering.")
+        print(f"[!] BPF capture failed ({exc}). Falling back to Python-level host filtering.")
+        print("[!] Note: protocol filtering may be less precise in fallback mode.")
+
+        protocol_set = {p.strip().lower() for p in protocols if p.strip()}
+
+        def protocol_matches(pkt) -> bool:
+            if not protocol_set or "all" in protocol_set or custom_bpf:
+                return True
+            proto = packet_protocol(pkt).lower()
+            if "web" in protocol_set and proto in {"http", "https"}:
+                return True
+            aliases = {"ping": "icmp"}
+            return proto in protocol_set or aliases.get(proto, proto) in protocol_set
 
         def lfilter(pkt) -> bool:
             try:
-                return pkt.haslayer(IP) and (pkt[IP].src == target_ip or pkt[IP].dst == target_ip)
+                host_match = False
+                if pkt.haslayer(IP):
+                    host_match = pkt[IP].src == target_ip or pkt[IP].dst == target_ip
+                elif pkt.haslayer(ARP):
+                    host_match = pkt[ARP].psrc == target_ip or pkt[ARP].pdst == target_ip
+                return host_match and protocol_matches(pkt)
             except Exception:
                 return False
 
@@ -398,6 +609,16 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     parser.add_argument("--count", type=int, default=50, help="Stop after this many packets. Use 0 for no count limit. Default: 50")
     parser.add_argument("--timeout", type=int, default=60, help="Stop capture after this many seconds. Use 0 for no timeout. Default: 60")
     parser.add_argument("--output", default="capture_selected_device.pcap", help="PCAP output path. Default: capture_selected_device.pcap")
+    parser.add_argument(
+        "--protocols",
+        default="all",
+        help=f"Comma-separated protocol presets to capture. Available: {available_protocols()}. Default: all",
+    )
+    parser.add_argument(
+        "--bpf",
+        help="Advanced custom BPF filter combined with selected host, e.g. 'tcp port 80 or udp port 53'. Overrides --protocols.",
+    )
+    parser.add_argument("--show-details", action="store_true", help="Print Scapy's packet summary in addition to the compact protocol summary.")
     parser.add_argument("--save-devices", action="store_true", help="Save discovered device information to discovered_devices.json/csv.")
     parser.add_argument("--list-only", action="store_true", help="Scan and list devices, then exit without capturing packets.")
     parser.add_argument("--arp-cache-only", action="store_true", help="Only show the system ARP table; skip active ARP scan and packet capture.")
@@ -456,7 +677,17 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         print(f"\n[+] Selected: {chosen.ip}  {chosen.mac}  {chosen.hostname}  {chosen.vendor}")
 
         timeout = None if args.timeout == 0 else args.timeout
-        capture_for_device(chosen.ip, args.output, args.iface, args.count, timeout)
+        protocols = [p.strip().lower() for p in args.protocols.split(",") if p.strip()]
+        capture_for_device(
+            chosen.ip,
+            args.output,
+            args.iface,
+            args.count,
+            timeout,
+            protocols,
+            custom_bpf=args.bpf,
+            show_details=args.show_details,
+        )
         return 0
     except KeyboardInterrupt:
         print("\n[!] Interrupted by user.")
